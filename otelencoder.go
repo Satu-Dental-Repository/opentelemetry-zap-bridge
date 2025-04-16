@@ -1,6 +1,8 @@
 package bridge
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -20,13 +22,47 @@ func newZapOtelEncoder(numberOfFields int) *zapOtelEncoder {
 }
 
 func (z *zapOtelEncoder) AddArray(key string, marshaler zapcore.ArrayMarshaler) error {
-	// TODO: use array encoder to add homogeneous arrays to the record
+	arr := &simpleArrayEncoder{}
+	if err := marshaler.MarshalLogArray(arr); err != nil {
+		return err
+	}
+
+	jsonValue, err := json.Marshal(arr.values)
+	if err != nil {
+		return err
+	}
+
+	z.OtelAttributes = append(z.OtelAttributes, attribute.String(key, string(jsonValue)))
 	return nil
 }
 
 func (z *zapOtelEncoder) AddObject(key string, marshaler zapcore.ObjectMarshaler) error {
-	// TODO: use object encoder to add k8s fields like in
-	// https://github.com/kubernetes-sigs/controller-runtime/blob/c93e2abcb28eb71fccad7dc565f0547cc07e5566/pkg/log/zap/kube_helpers.go#L49
+	sub := &objectToMapEncoder{
+		m:          map[string]any{},
+		namespaces: []string{},
+	}
+
+	err := marshaler.MarshalLogObject(sub)
+	if err != nil {
+		return err
+	}
+
+	for k, v := range sub.m {
+		attrKey := fmt.Sprintf("%s.%s", key, k)
+		switch val := v.(type) {
+		case string:
+			z.OtelAttributes = append(z.OtelAttributes, attribute.String(attrKey, val))
+		case int, int64:
+			z.OtelAttributes = append(z.OtelAttributes, attribute.Int64(attrKey, toInt64(val)))
+		case bool:
+			z.OtelAttributes = append(z.OtelAttributes, attribute.Bool(attrKey, val))
+		case float64:
+			z.OtelAttributes = append(z.OtelAttributes, attribute.Float64(attrKey, val))
+		default:
+			// fallback to string
+			z.OtelAttributes = append(z.OtelAttributes, attribute.String(attrKey, fmt.Sprintf("%v", val)))
+		}
+	}
 	return nil
 }
 
@@ -127,4 +163,15 @@ func (z *zapOtelEncoder) AddReflected(key string, value interface{}) error {
 
 func (z *zapOtelEncoder) OpenNamespace(key string) {
 	// TODO: how should this be translated to opentelemetry?
+}
+
+func toInt64(v interface{}) int64 {
+	switch i := v.(type) {
+	case int:
+		return int64(i)
+	case int64:
+		return i
+	default:
+		return 0
+	}
 }
