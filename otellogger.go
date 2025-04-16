@@ -73,8 +73,11 @@ func (o *OtelZapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcor
 }
 
 func (o *OtelZapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
-	otelSeverity := convertZapLevelToOtelSeverity(ent.Level)
-	severityText := ent.Level.String()
+	otelSeverity, severityText := convertZapLevelToOtelSeverity(ent.Level)
+
+	fields = append(fields, []zap.Field{
+		zap.String("stacktrace", ent.Stack),
+	}...)
 
 	otelEncoder := newZapOtelEncoder(len(fields))
 	for _, field := range fields {
@@ -94,7 +97,8 @@ func (o *OtelZapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 	return nil
 }
 
-func convertZapLevelToOtelSeverity(zapLevel zapcore.Level) logs.SeverityNumber {
+func convertZapLevelToOtelSeverity(zapLevel zapcore.Level) (logs.SeverityNumber, string) {
+
 	// zap levels seems to be int8 and can be negative!
 	// it appears that the debug level is -1, and 0 should not be used for otel severity
 	// as stated in the docs of the otel enum.
@@ -105,5 +109,19 @@ func convertZapLevelToOtelSeverity(zapLevel zapcore.Level) logs.SeverityNumber {
 	// but - is it always true? what happens when zap is triggered by logr with something like
 	// `log.V(2).Info("message")`?
 	// We should check these cases and possibly use more accurate mapping.
-	return logs.SeverityNumber(zapLevel + 2)
+
+	switch zapLevel {
+	case zapcore.DebugLevel:
+		return 5, "DEBUG" // SeverityNumberDebug
+	case zapcore.InfoLevel:
+		return 9, "INFO" // SeverityNumberInfo
+	case zapcore.WarnLevel:
+		return 13, "WARN" // SeverityNumberWarn
+	case zapcore.ErrorLevel:
+		return 17, "ERROR" // SeverityNumberError
+	case zapcore.DPanicLevel, zapcore.PanicLevel, zapcore.FatalLevel:
+		return 21, "FATAL" // SeverityNumberFatal
+	default:
+		return 9, "INFO" // SeverityNumberUnspecified
+	}
 }
