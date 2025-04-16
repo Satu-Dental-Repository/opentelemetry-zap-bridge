@@ -1,4 +1,4 @@
-module github.com/odigos-io/opentelemetry-zap-bridge
+module github.com/Satu-Dental-Repository/opentelemetry-zap-bridge
 
 go 1.22.0
 
