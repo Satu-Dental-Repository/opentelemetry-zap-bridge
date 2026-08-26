@@ -4,9 +4,11 @@ import (
 	"context"
 	"os"
 	"strings"
+	"time"
 
 	autosdk "github.com/agoda-com/opentelemetry-logs-go/autoconfigure/sdk/logs"
 	"github.com/agoda-com/opentelemetry-logs-go/logs"
+	sdk "github.com/agoda-com/opentelemetry-logs-go/sdk/logs"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -16,10 +18,27 @@ const (
 	instrumentationLibraryName = "github.com/odigos-io/opentelemetry-zap-bridge"
 )
 
+// syncTimeout bounds the flush that Sync performs.
+//
+// zapcore.Core.Sync carries no context, so the bound has to live here. It exists rather than
+// blocking indefinitely because the callers that need Sync most are short-lived processes — a
+// CronJob under concurrencyPolicy: Forbid, where a flush that hangs against an unreachable
+// collector does not merely delay the pod, it starts skipping the next tick's work.
+const syncTimeout = 5 * time.Second
+
 type OtelZapCore struct {
 	zapcore.Core
 
 	logger logs.Logger
+
+	// provider is retained SOLELY so the records this core buffers can be flushed.
+	//
+	// Without it the provider is unreachable the moment NewOtelZapCore returns, and its batch
+	// processor's buffer is lost whenever the process exits before the batch timer fires. That is
+	// invisible in a long-running service and total in a short-lived one: measured on a Kubernetes
+	// CronJob fleet, one cron in twenty delivered two log lines in twenty-four hours while every
+	// metric arrived, because metrics had an explicit shutdown and logs had no handle to call one on.
+	provider *sdk.LoggerProvider
 }
 
 // this function creates a new zapcore.Core that can be used with zap.New()
@@ -32,6 +51,23 @@ type OtelZapCore struct {
 // Currently a user can configure the SDK only via environment variables which is fair enough
 // but advanced users might want more control.
 func NewOtelZapCore() zapcore.Core {
+	core, _ := NewOtelZapCoreWithShutdown()
+
+	return core
+}
+
+// NewOtelZapCoreWithShutdown is NewOtelZapCore plus the handle needed to flush it.
+//
+// The returned function shuts the LoggerProvider down, delivering whatever the batch processor is
+// still holding, and is safe to call more than once. It honours the caller's context, so a process
+// that already budgets its telemetry shutdown — one deadline per signal, so a dead collector cannot
+// spend another signal's budget — can give this one the same treatment.
+//
+// PREFER THIS OVER NewOtelZapCore IN ANY PROCESS THAT EXITS. A cron, a job, a CLI or a test binary
+// finishes long before the batch timer fires, and without this its logs are simply dropped — no
+// error, no warning, and the records are gone. A long-running service can keep using NewOtelZapCore,
+// where the periodic flush is enough.
+func NewOtelZapCoreWithShutdown() (zapcore.Core, func(context.Context) error) {
 	ctx := context.Background()
 	loggerProvider := autosdk.NewLoggerProvider(ctx)
 	// TODO: what scope name should we use?
@@ -39,9 +75,12 @@ func NewOtelZapCore() zapcore.Core {
 	// how do we record correct scope name with zap?
 	logger := loggerProvider.Logger(instrumentationLibraryName)
 
-	return &OtelZapCore{
-		logger: logger,
+	core := &OtelZapCore{
+		logger:   logger,
+		provider: loggerProvider,
 	}
+
+	return core, core.shutdown
 }
 
 // TODO: I guess there is more idomatic way to do this in go
@@ -61,6 +100,39 @@ func AttachToZapLogger(logger *zap.Logger) *zap.Logger {
 // TODO: see how it is implemented in zapcore and consider adding it here as well
 func (o *OtelZapCore) Enabled(zapcore.Level) bool {
 	return true
+}
+
+// Sync flushes the records this core is holding, which is what zap's contract asks of it.
+//
+// It also closes a latent panic. OtelZapCore embeds zapcore.Core as an interface and never assigns
+// it, so before this method existed Sync was promoted to that nil interface — any caller doing the
+// ordinary `defer logger.Sync()` would have taken a nil dereference. Nothing in this repository's
+// dependents called it, which is the only reason it went unnoticed.
+//
+// The flush is bounded by syncTimeout because Sync takes no context; a caller that needs to choose
+// its own deadline should use the shutdown function from NewOtelZapCoreWithShutdown instead.
+func (o *OtelZapCore) Sync() error {
+	if o.provider == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
+	defer cancel()
+
+	return o.provider.ForceFlush(ctx)
+}
+
+// shutdown delivers what the batch processor still holds and releases it.
+//
+// Shutdown rather than ForceFlush: this is the end of the process, so the processor should stop
+// accepting records as well as drain, and calling it twice must not be an error for a caller whose
+// cleanup runs on more than one path.
+func (o *OtelZapCore) shutdown(ctx context.Context) error {
+	if o.provider == nil {
+		return nil
+	}
+
+	return o.provider.Shutdown(ctx)
 }
 
 // TODO: implement this and add the fields to each new log record created
