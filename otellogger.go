@@ -9,6 +9,7 @@ import (
 	autosdk "github.com/agoda-com/opentelemetry-logs-go/autoconfigure/sdk/logs"
 	"github.com/agoda-com/opentelemetry-logs-go/logs"
 	sdk "github.com/agoda-com/opentelemetry-logs-go/sdk/logs"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -163,6 +164,7 @@ func (o *OtelZapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		SeverityText:   &severityText,
 		Attributes:     &otelEncoder.OtelAttributes,
 	}
+	lrc.TraceId, lrc.SpanId = traceContext(fields)
 	logRecord := logs.NewLogRecord(lrc)
 	o.logger.Emit(logRecord)
 
@@ -196,4 +198,55 @@ func convertZapLevelToOtelSeverity(zapLevel zapcore.Level) (logs.SeverityNumber,
 	default:
 		return 9, "INFO" // SeverityNumberUnspecified
 	}
+}
+
+// Field names whose values, when they parse as W3C ids, become the record's own trace context.
+//
+// zapcore.Core.Write carries no context.Context, so the request's span cannot be read here. A
+// caller that already puts the ids on the line — as `trace_id` and `span_id` string fields, the
+// names OpenTelemetry's log data model uses — gets them promoted into the record's TraceId and
+// SpanId, which is what a backend joins on to show a trace's logs. Without this the ids travel as
+// ordinary attributes: searchable, but SigNoz's "logs for this trace" view stays empty. The
+// attributes are still written, so an existing query on them keeps working.
+//
+// The contract, for any consumer:
+//   - Only the line's own fields count. With() is still a no-op on this core, so ids bound through
+//     logger.With(...) are neither promoted nor exported at all.
+//   - Only string fields count (zap.String); a zap.Stringer of a trace.TraceID is ignored.
+//   - The values must come from a live span, never from request input: a valid id under these
+//     names attaches the line to that trace, whoever chose it.
+//   - If a key repeats, the last VALID value wins; a malformed repeat does not erase a valid one.
+//   - TraceFlags stay unset (0): the line does not carry the sampled bit, and backends, SigNoz
+//     included, join on the trace id alone.
+const (
+	traceIDField = "trace_id"
+	spanIDField  = "span_id"
+)
+
+// traceContext returns the trace and span id carried by fields, or nils.
+//
+// Only string fields that are valid, non-zero hex ids count: a malformed or unrelated value must
+// not invent a trace. A span id without a trace id is dropped, because it identifies nothing.
+func traceContext(fields []zapcore.Field) (*trace.TraceID, *trace.SpanID) {
+	var traceID *trace.TraceID
+	var spanID *trace.SpanID
+	for _, f := range fields {
+		if f.Type != zapcore.StringType {
+			continue
+		}
+		switch f.Key {
+		case traceIDField:
+			if id, err := trace.TraceIDFromHex(f.String); err == nil {
+				traceID = &id
+			}
+		case spanIDField:
+			if id, err := trace.SpanIDFromHex(f.String); err == nil {
+				spanID = &id
+			}
+		}
+	}
+	if traceID == nil {
+		return nil, nil
+	}
+	return traceID, spanID
 }
