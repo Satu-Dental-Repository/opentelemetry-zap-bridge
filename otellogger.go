@@ -208,6 +208,16 @@ func convertZapLevelToOtelSeverity(zapLevel zapcore.Level) (logs.SeverityNumber,
 // SpanId, which is what a backend joins on to show a trace's logs. Without this the ids travel as
 // ordinary attributes: searchable, but SigNoz's "logs for this trace" view stays empty. The
 // attributes are still written, so an existing query on them keeps working.
+//
+// The contract, for any consumer:
+//   - Only the line's own fields count. With() is still a no-op on this core, so ids bound through
+//     logger.With(...) are neither promoted nor exported at all.
+//   - Only string fields count (zap.String); a zap.Stringer of a trace.TraceID is ignored.
+//   - The values must come from a live span, never from request input: a valid id under these
+//     names attaches the line to that trace, whoever chose it.
+//   - If a key repeats, the last VALID value wins; a malformed repeat does not erase a valid one.
+//   - TraceFlags stay unset (0): the line does not carry the sampled bit, and backends, SigNoz
+//     included, join on the trace id alone.
 const (
 	traceIDField = "trace_id"
 	spanIDField  = "span_id"
